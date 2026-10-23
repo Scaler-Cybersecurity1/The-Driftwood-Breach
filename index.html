@@ -1,0 +1,752 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Driftwood Breach</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<meta name="description" content="SOC-01 — a hands-on investigation lab: search real access logs and dissect a phishing email to trace an account takeover, then recover a flag.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700;800&family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+<style>
+/* Layout: a SOC analyst's console — a sticky case bar over a two-pane workspace:
+   the current investigation task on the left, the live tools (reported email + a
+   searchable access-log table) on the right. The work happens in the log search. */
+:root {
+  --bg: #eef1f5; --surface: #ffffff; --surface-2: #e5eaf1; --ink: #141a23; --muted: #566276;
+  --line: #d2d9e3; --accent: #0b6e8c; --accent-soft: #daeef4; --accent-ink: #ffffff;
+  --good: #1d7a4b; --bad: #b42318; --hot: #b4530a; --hot-soft: #fbeadb;
+  --bar: #14212b; --bar-ink: #e9f1f5; --bar-muted: #8ba6b3;
+  --font-display: "Archivo", Arial, system-ui, sans-serif;
+  --font-body: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, Menlo, Consolas, monospace;
+  --radius: 6px; color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #0c1116; --surface: #121a22; --surface-2: #19242e; --ink: #e3ebf1; --muted: #90a2ad;
+    --line: #253440; --accent: #4bc0dd; --accent-soft: #10323c; --accent-ink: #06181d;
+    --good: #4cc38a; --bad: #f2777a; --hot: #f0a04b; --hot-soft: #3a2611;
+    --bar: #080e12; --bar-ink: #e3ebf1; --bar-muted: #7e95a1; color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #0c1116; --surface: #121a22; --surface-2: #19242e; --ink: #e3ebf1; --muted: #90a2ad;
+  --line: #253440; --accent: #4bc0dd; --accent-soft: #10323c; --accent-ink: #06181d;
+  --good: #4cc38a; --bad: #f2777a; --hot: #f0a04b; --hot-soft: #3a2611;
+  --bar: #080e12; --bar-ink: #e3ebf1; --bar-muted: #7e95a1; color-scheme: dark;
+}
+*, *::before, *::after { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; }
+body { margin: 0; background: var(--bg); color: var(--ink); font: 15px/1.55 var(--font-body); }
+body::before { content: ""; position: fixed; inset: 0 0 auto; height: env(safe-area-inset-top, 0px); z-index: 10; background: var(--bar); }
+[hidden] { display: none !important; }
+button, input { font: inherit; color: inherit; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.gutter { padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); }
+.inner { max-width: 1320px; margin: 0 auto; }
+.eyebrow { font: 600 11.5px/1.2 var(--font-body); letter-spacing: .09em; text-transform: uppercase; color: var(--muted); }
+h1, h2, h3 { font-family: var(--font-display); text-wrap: balance; margin: 0; }
+.mono { font-family: var(--font-mono); }
+
+/* case bar */
+.topbar { position: sticky; top: env(safe-area-inset-top, 0px); z-index: 5; background: var(--bar); color: var(--bar-ink); padding-block: 12px; }
+.topbar .inner { display: grid; grid-template-columns: auto 1fr auto; gap: 10px 24px; align-items: center; }
+.case-id { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.case-id .eyebrow { color: var(--bar-muted); }
+.case-id strong { font: 700 16px/1.2 var(--font-display); }
+.steps { display: flex; gap: 4px; list-style: none; margin: 0; padding: 0; min-width: 0; }
+.steps li { flex: 1; min-width: 0; font-size: 11.5px; line-height: 1.25; color: var(--bar-muted); padding-top: 7px;
+  border-top: 3px solid color-mix(in srgb, var(--bar-ink) 16%, transparent); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.steps li.done { color: var(--bar-ink); border-top-color: color-mix(in srgb, var(--good) 60%, transparent); }
+.steps li.now { color: var(--bar-ink); font-weight: 600; border-top-color: var(--accent); }
+.progress { text-align: right; font: 500 13px/1.3 var(--font-mono); color: var(--bar-muted); }
+.progress b { color: var(--bar-ink); font-weight: 600; }
+
+main { padding-block: 24px 44px; }
+.workspace { display: grid; grid-template-columns: minmax(0, 0.95fr) minmax(0, 1.2fr); gap: 24px; align-items: start; }
+.panel { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); }
+
+/* task panel */
+.task { padding: 24px 26px 26px; display: flex; flex-direction: column; gap: 18px; min-width: 0; }
+.task-head { display: flex; justify-content: space-between; gap: 12px; align-items: baseline; flex-wrap: wrap; }
+.task h2 { font-size: clamp(22px, 2.8vw, 28px); font-weight: 700; line-height: 1.1; letter-spacing: -.005em; }
+.counter { font-family: var(--font-mono); font-size: 12.5px; color: var(--muted); }
+.msg { display: grid; grid-template-columns: 36px 1fr; gap: 12px; padding: 14px 16px; background: var(--surface-2); border-radius: var(--radius); }
+.avatar { width: 36px; height: 36px; border-radius: 50%; display: grid; place-items: center; background: var(--accent); color: var(--accent-ink); font: 600 13px/1 var(--font-body); }
+.msg .who { font-size: 13px; color: var(--muted); } .msg .who b { color: var(--ink); font-weight: 600; }
+.msg p { margin: 4px 0 0; }
+.brief p { margin: 0 0 10px; max-width: 66ch; } .brief p:last-child { margin: 0; }
+.steer { border-left: 3px solid var(--accent); padding: 2px 0 2px 14px; display: grid; gap: 6px; }
+.steer p { margin: 0; font-size: 13.5px; color: var(--muted); max-width: 66ch; } .steer b { color: var(--ink); }
+.prompt { font: 600 17px/1.35 var(--font-display); }
+.fieldset { display: grid; gap: 16px; }
+.field { display: grid; gap: 8px; }
+.field label { font-weight: 600; font-size: 14px; }
+.field .sub { font-size: 13px; color: var(--muted); margin: -4px 0 0; }
+.answer-row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+.answer-row input { flex: 1 1 240px; min-width: 0; padding: 11px 12px; border-radius: var(--radius); border: 1px solid var(--line); background: var(--surface); font-family: var(--font-mono); }
+.answer-row input:focus { border-color: var(--accent); outline: none; box-shadow: 0 0 0 3px var(--accent-soft); }
+.answer-row input:disabled { opacity: .7; }
+.status { font-family: var(--font-mono); font-size: 13px; min-width: 1.5em; }
+.status.ok { color: var(--good); } .status.no { color: var(--bad); }
+.hint { font-size: 13px; color: var(--muted); margin: 0; max-width: 66ch; }
+details.tip { font-size: 13px; }
+details.tip summary { cursor: pointer; color: var(--accent); width: fit-content; }
+details.tip p { margin: 8px 0 0; color: var(--muted); max-width: 66ch; }
+.options { display: grid; gap: 10px; }
+.opt { display: grid; grid-template-columns: 28px 1fr; gap: 12px; text-align: left; align-items: start; padding: 13px 14px;
+  border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); cursor: pointer; transition: border-color .15s, background-color .15s; }
+.opt:hover:not(:disabled) { border-color: var(--accent); background: var(--accent-soft); }
+.opt .key { width: 28px; height: 28px; border-radius: 4px; display: grid; place-items: center; font: 600 13px/1 var(--font-mono); border: 1px solid var(--line); color: var(--muted); }
+.opt:disabled { cursor: default; } .opt.faded { opacity: .45; }
+.opt.chosen { border-color: var(--accent); background: var(--accent-soft); } .opt.chosen .key { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
+.outcome { border-left: 3px solid var(--accent); padding: 4px 0 4px 16px; } .outcome p { margin: 0; max-width: 66ch; }
+.actions { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+.btn { border: 1px solid transparent; border-radius: var(--radius); padding: 10px 16px; cursor: pointer; font-weight: 600; font-size: 14px; background: var(--accent); color: var(--accent-ink); }
+.btn:hover { filter: brightness(1.07); } .btn:disabled { opacity: .45; cursor: not-allowed; filter: none; }
+.btn.ghost { background: transparent; color: var(--ink); border-color: var(--line); } .btn.ghost:hover { border-color: var(--muted); filter: none; }
+.to-tools { font-size: 13.5px; color: var(--accent); background: none; border: 0; cursor: pointer; padding: 0; text-decoration: underline; display: none; }
+
+/* tools panel */
+.tools { display: grid; gap: 0; min-width: 0; overflow: hidden; }
+.tool-tabs { display: flex; gap: 2px; padding: 12px 12px 0; border-bottom: 1px solid var(--line); }
+.ttab { border: 0; background: transparent; padding: 9px 12px 11px; cursor: pointer; font-size: 13.5px; color: var(--muted); border-bottom: 2px solid transparent; margin-bottom: -1px; display: inline-flex; gap: 7px; align-items: center; }
+.ttab:hover:not(:disabled) { color: var(--ink); } .ttab.active { color: var(--ink); font-weight: 600; border-bottom-color: var(--accent); }
+.ttab:disabled { opacity: .5; cursor: not-allowed; }
+.lock { font: 600 10px/1 var(--font-body); letter-spacing: .05em; padding: 3px 5px; border-radius: 3px; background: var(--surface-2); color: var(--muted); }
+.ttab .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--hot); }
+.tool-body { padding: 16px 18px 18px; display: grid; gap: 12px; min-width: 0; }
+
+.mail-meta { display: grid; gap: 2px; font-size: 12.5px; color: var(--muted); }
+.doc { font: 13px/1.6 var(--font-mono); background: var(--surface-2); padding: 16px; border-radius: var(--radius); white-space: pre-wrap; overflow-wrap: anywhere; margin: 0; }
+.doc .mk { background: color-mix(in srgb, var(--hot) 22%, transparent); border-radius: 3px; padding: 0 2px; }
+
+/* log console */
+.console-top { display: grid; gap: 10px; }
+.search-wrap { display: flex; gap: 8px; align-items: center; }
+.search-wrap input { flex: 1; min-width: 0; padding: 10px 12px; border-radius: var(--radius); border: 1px solid var(--line); background: var(--surface-2); font-family: var(--font-mono); font-size: 13.5px; }
+.search-wrap input:focus { border-color: var(--accent); outline: none; background: var(--surface); }
+.chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.fchip { font: 500 12px/1 var(--font-mono); padding: 6px 9px; border-radius: 999px; border: 1px solid var(--line); background: var(--surface); cursor: pointer; color: var(--muted); }
+.fchip:hover { border-color: var(--accent); color: var(--ink); } .fchip.on { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
+.count { font: 500 12.5px/1 var(--font-mono); color: var(--muted); }
+.count b { color: var(--ink); }
+.table-wrap { overflow: auto; border: 1px solid var(--line); border-radius: var(--radius); max-height: 520px; }
+table { border-collapse: collapse; width: 100%; font: 12px/1.4 var(--font-mono); font-variant-numeric: tabular-nums; }
+th { position: sticky; top: 0; background: var(--surface-2); text-align: left; font: 600 10.5px/1.3 var(--font-body); letter-spacing: .04em; text-transform: uppercase; color: var(--muted); padding: 8px 9px; white-space: nowrap; z-index: 1; }
+td { padding: 6px 9px; border-top: 1px solid var(--line); white-space: nowrap; }
+td.path { white-space: normal; min-width: 170px; overflow-wrap: anywhere; }
+tbody tr:hover { background: var(--accent-soft); }
+.st-200 { color: var(--good); } .st-401, .st-403, .st-404 { color: var(--hot); } .st-500 { color: var(--bad); }
+mark { background: color-mix(in srgb, var(--hot) 35%, transparent); color: inherit; border-radius: 2px; padding: 0 1px; }
+.norows { padding: 20px; text-align: center; color: var(--muted); font-size: 13.5px; }
+.console-help { font-size: 12.5px; color: var(--muted); margin: 0; }
+
+/* briefing + report */
+.sheet { max-width: 880px; margin: 0 auto; padding: 32px 34px; display: grid; gap: 22px; }
+.sheet h1 { font-size: clamp(36px, 7vw, 56px); font-weight: 800; line-height: .98; letter-spacing: -.015em; }
+.sheet .lede { font-size: 17px; max-width: 64ch; margin: 0; }
+.facts { display: grid; grid-template-columns: repeat(3, minmax(0,1fr)); gap: 1px; background: var(--line); border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden; }
+.facts div { background: var(--surface); padding: 12px 14px; display: grid; gap: 4px; } .facts b { font-size: 14px; font-weight: 600; }
+.rules { margin: 0; padding-left: 20px; display: grid; gap: 7px; max-width: 72ch; } .rules li::marker { color: var(--accent); }
+.sheet h2 { font-size: 21px; font-weight: 700; }
+.flagbox { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; justify-content: space-between; padding: 16px 18px; border: 2px dashed var(--accent); border-radius: var(--radius); background: var(--accent-soft); }
+.flagbox code { font: 500 clamp(15px,2.6vw,21px)/1.3 var(--font-mono); overflow-wrap: anywhere; min-width: 0; }
+.verdict { display: grid; grid-template-columns: auto 1fr; gap: 18px; align-items: center; }
+.grade { font: 800 42px/1 var(--font-display); width: 82px; height: 82px; display: grid; place-items: center; border-radius: var(--radius); border: 2px solid currentColor; }
+.verdict h2 { margin-bottom: 4px; } .verdict p { margin: 0; color: var(--muted); max-width: 60ch; }
+.debrief { list-style: none; margin: 0; padding: 0; border-top: 1px solid var(--line); }
+.debrief li { display: grid; grid-template-columns: 110px 1fr; gap: 14px; padding: 14px 0; border-bottom: 1px solid var(--line); }
+.debrief .t { font-family: var(--font-mono); font-size: 12px; color: var(--muted); padding-top: 2px; }
+.debrief h3 { font-size: 15px; font-weight: 700; margin-bottom: 4px; }
+.debrief p { margin: 3px 0 0; font-size: 13.5px; max-width: 72ch; }
+.debrief .yours.good { color: var(--good); } .debrief .yours.bad { color: var(--bad); } .debrief .yours { font-family: var(--font-mono); font-size: 13px; }
+.debrief .lesson { color: var(--muted); } .debrief .lesson b { color: var(--ink); }
+.restart-row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+footer { padding-block: 0 32px; font-size: 12.5px; color: var(--muted); }
+footer .inner { border-top: 1px solid var(--line); padding-top: 14px; }
+
+@media (max-width: 980px) {
+  .workspace { grid-template-columns: minmax(0,1fr); }
+  .to-tools { display: inline; }
+}
+@media (max-width: 720px) {
+  .topbar .inner { grid-template-columns: 1fr auto; }
+  .steps { grid-column: 1 / -1; grid-row: 2; }
+  .steps li { font-size: 0; } .steps li.now { font-size: 11.5px; flex: 4; }
+  .task, .sheet { padding: 20px 18px; }
+  .facts { grid-template-columns: 1fr; }
+  .debrief li { grid-template-columns: 1fr; gap: 4px; }
+}
+@media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+</style>
+</head>
+<body>
+
+<header class="topbar gutter">
+  <div class="inner">
+    <div class="case-id">
+      <span class="eyebrow">Driftwood Analytics · SOC case</span>
+      <strong>CASE-2026-1014-SEV2</strong>
+    </div>
+    <ol class="steps" id="steps" aria-label="Investigation step"></ol>
+    <div class="progress" id="progress"></div>
+  </div>
+</header>
+
+<main class="gutter">
+  <div class="inner">
+
+    <section class="panel sheet" id="briefing">
+      <div class="eyebrow">SOC Investigation Lab · SOC-01</div>
+      <h1>The Driftwood Breach</h1>
+      <p class="lede">You're a Tier-2 analyst at Driftwood Analytics, a SaaS company. A customer-success manager reports a phishing email, and minutes of odd traffic follow on the customer portal. Work out what happened — by searching the logs yourself.</p>
+      <div class="facts">
+        <div><span class="eyebrow">Your role</span><b>Tier-2 SOC analyst</b></div>
+        <div><span class="eyebrow">Time needed</span><b>25–35 minutes</b></div>
+        <div><span class="eyebrow">You will</span><b>Dissect 1 email · search the logs · make 2 calls</b></div>
+      </div>
+      <h2>How this lab works</h2>
+      <ol class="rules">
+        <li>There are <b>no multiple-choice answers to find facts.</b> You read the reported email and <b>search the access logs</b> in the console on the right to work the answers out yourself.</li>
+        <li>Each step unlocks the next. Type what the evidence actually shows — an account name, an IP address, a domain — into the answer boxes.</li>
+        <li>The logs hold hundreds of lines of normal traffic and decoys. Use the search box and quick filters to narrow them down, the way you would in a real SOC.</li>
+        <li>Two response decisions at the end set your grade. The <b>flag</b> is built only from the facts you recover. Submit it on your course platform.</li>
+        <li>Nothing leaves your browser; answers are checked locally. Progress is saved on this device.</li>
+      </ol>
+      <div class="restart-row">
+        <button class="btn" id="startBtn" type="button">Open the case</button>
+        <button class="btn ghost" id="resetBtn" type="button" hidden>Start over</button>
+        <span class="hint" id="resumeHint" hidden>Progress on this device was restored.</span>
+      </div>
+    </section>
+
+    <div class="workspace" id="console" hidden>
+      <section class="panel task" id="task" aria-live="polite"></section>
+      <section class="panel tools" aria-label="Investigation tools">
+        <div class="tool-tabs" id="toolTabs" role="tablist"></div>
+        <div class="tool-body" id="toolBody"></div>
+      </section>
+    </div>
+
+    <section class="panel sheet" id="report" hidden></section>
+  </div>
+</main>
+
+<footer class="gutter">
+  <div class="inner">Fictional training scenario. Driftwood Analytics, its staff and systems are invented; all IP addresses are from reserved documentation ranges (RFC&nbsp;5737).</div>
+</footer>
+
+<script>
+"use strict";
+
+/* =====================================================================
+   SCENARIO — edit here to build new labs.
+   Answers are checked by SHA-256 hash, so the correct values never appear
+   in the page source. Recompute with:  printf '%s' 'answer' | shasum -a 256
+   ===================================================================== */
+
+const EMAIL = {
+  from: "IT Security <alerts@meridian-security.net>",
+  to: "d.okafor@driftwood-analytics.com",
+  received: "Tue 14 Oct 2026, 13:02",
+  subjectLine: "Subject: [Action required] Unusual sign-in — reverify your portal access",
+  raw:
+`Delivered-To: d.okafor@driftwood-analytics.com
+Received: from mail.meridian-security.net ([198.51.100.200])
+        by mx.driftwood-analytics.com; Tue, 14 Oct 2026 13:02:11 +0000
+From: "Driftwood IT Security" <alerts@meridian-security.net>
+Reply-To: helpdesk@meridian-security.net
+To: d.okafor@driftwood-analytics.com
+Subject: [Action required] Unusual sign-in — reverify your portal access
+Message-ID: <7f23@meridian-security.net>
+
+Hi Deborah,
+
+We detected an unusual sign-in to your Driftwood portal account.
+To keep your access, reverify within 2 hours:
+
+    https://portal.meridian-security.net/verify?u=d.okafor
+
+If you don't reverify, your admin access will be suspended.
+
+Driftwood IT Security
+
+-- Driftwood's real mail domain is driftwood-analytics.com.
+   This message did not come from it.`
+};
+
+/* fields the student must recover; flag uses q_domain, q_account, q_ip */
+const ANSWERS = {
+  q_domain:  { hash: "3845503d34cada9ab6106b63578aff2b370c08f3228055a896873a98aa8d3663" },
+  q_account: { hash: "cf9d7bcf14c7327527f9473d4ffc1624e6bc18fd339f39e03079a064f1f6319d" },
+  q_ip:      { hash: "bfeb4c6192985efa05e7fa0740ac45708a515e569e7edaec7fc060ff72b44a0c" },
+  q_records: { hash: "73b3062d0cb20fb0f594bb458215e30cc516e65cf8e1d686fed19393544435b1", norm: "digits" }
+};
+
+const STEPS = [
+  {
+    kind: "dissect", id: "s1", label: "Triage the email", unlock: "mail",
+    title: "Start with the reported email",
+    from: { name: "Deborah Okafor", role: "customer-success manager", initials: "DO" },
+    message: "I got this 'reverify your access' email and clicked the link before I realised. It looked like our IT team. Was it real?",
+    brief: [
+      "Open the Reported email tab on the right and read the full headers, not just the body.",
+      "A phishing email almost always comes from a look-alike domain that isn't the company's real one."
+    ],
+    steer: "Driftwood's real mail domain is <b>driftwood-analytics.com</b>. Find the domain this message actually came <b>from</b> — check the From address and the Received line.",
+    fields: [
+      { id: "q_domain", label: "What domain did the phishing email actually come from?",
+        sub: "The sending domain, not driftwood-analytics.com.", placeholder: "domain",
+        tip: "In the headers, the From address is alerts@<b>?</b> and the Received line says 'from mail.<b>?</b>'. That domain impersonates Driftwood." }
+    ]
+  },
+  {
+    kind: "investigate", id: "s2", label: "Trace the takeover", unlock: "logs",
+    title: "Find the compromised account and the attacker",
+    from: { name: "Sam Reyes", role: "SOC lead", initials: "SR" },
+    message: "The portal access logs are loaded in your console now. Deborah clicked that link around 13:02. Somewhere after that, her account gets used from an IP that isn't hers. Find it.",
+    brief: [
+      "Switch to the Access logs tab. Search and filter the portal traffic to trace the account takeover.",
+      "Deborah normally signs in from the office range (203.0.113.x). After the phishing, a login SUCCEEDS for her account from a different, outside IP — that's the attacker."
+    ],
+    steer: "Search a path or an account in the box; click a quick filter to stack conditions. Watch out for noise: a separate scanner hits the site around the same time but never logs in successfully. You want the IP that got a <b>200</b> on <b>POST /login</b> as Deborah's account.",
+    fields: [
+      { id: "q_account", label: "Which portal account was taken over?",
+        sub: "The admin account the attacker logged in as.", placeholder: "username",
+        tip: "Deborah's name in the email is Deborah Okafor. Portal usernames here are first-initial.surname — so filter the logs for that account and watch where it logs in from." },
+      { id: "q_ip", label: "What is the attacker's source IP address?",
+        sub: "The outside IP that logged in as that account and then reached /admin.", placeholder: "x.x.x.x",
+        tip: "Filter for the account, or search '/admin'. The attacker IP has a successful POST /login as that account AND then GETs /admin pages. A different 198.51.100.x address only scans for files like /wp-login.php and gets 404s — that's a decoy, not the attacker." }
+    ]
+  },
+  {
+    kind: "investigate", id: "s3", label: "Scope the loss", unlock: null,
+    title: "Scope what was taken",
+    from: { name: "Sam Reyes", role: "SOC lead", initials: "SR" },
+    message: "Good — that's the attacker. Now I need the impact for the report: did they actually exfiltrate data, and how much?",
+    brief: [
+      "Stay in the Access logs. The attacker didn't just look around — they used an export endpoint to pull customer data out.",
+      "Find the export request from the attacker's IP. The number of records is recorded right in the request."
+    ],
+    steer: "Search <b>/admin/export</b>. The matching request from the attacker's IP returns 200, and its query string includes the row count that was exported.",
+    fields: [
+      { id: "q_records", label: "How many customer records were exported?",
+        sub: "The number in the export request (digits only).", placeholder: "number",
+        tip: "The line is POST /admin/export?format=csv&rows=<b>?</b> with status 200 from the attacker IP. Enter just the number." }
+    ]
+  },
+  {
+    kind: "decision", id: "s4", label: "Contain", unlock: null,
+    title: "Your first containment action",
+    from: { name: "Sam Reyes", role: "SOC lead", initials: "SR" },
+    message: "We know the account, the IP and the data loss. It's 14:40. What's your first containment move — pick the one that stops the bleeding without destroying what we need?",
+    brief: [ "You've confirmed an active account takeover with data exfiltration from a single external IP." ],
+    prompt: "What do you do first?",
+    options: [
+      { id: "a", text: "Disable the compromised account and kill its active sessions, then block the attacker IP at the perimeter.",
+        best: true, fx: { c: 20, t: 8 },
+        result: "This cuts the attacker's access immediately: the stolen credential stops working, their live session is terminated, and the source IP can no longer reach the portal. Targeted and reversible — exactly right as a first move.",
+        tag: "Targeted containment" },
+      { id: "b", text: "Take the whole customer portal offline for all 600 users until further notice.",
+        fx: { c: 10, o: -20 },
+        result: "It stops the attacker, but it also stops every legitimate customer and colleague. For a single compromised account from one IP, a full outage is disproportionate — you have precise controls available.",
+        tag: "Disproportionate" },
+      { id: "c", text: "Email Deborah asking her to change her password when she's next online.",
+        fx: { c: -8, t: -5 },
+        result: "Far too slow and too weak. The attacker already holds a live session; a polite password-reset request hours later does nothing to stop active exfiltration.",
+        tag: "Too slow, active attacker" }
+    ]
+  },
+  {
+    kind: "decision", id: "s5", label: "Prevent", unlock: null,
+    title: "Stop it recurring",
+    from: { name: "Priya Nair", role: "CISO", initials: "PN" },
+    message: "Contained and reported. The chain was: phishing email → Deborah entered her password on a fake page → attacker logged into the real portal from outside → exported data. One control, funded now. What's your pick?",
+    brief: [ "The attacker used a genuine password on the real portal. Choose the control that most directly breaks that chain." ],
+    prompt: "Your top recommendation?",
+    options: [
+      { id: "a", text: "Require phishing-resistant MFA on the portal for all staff, plus targeted phishing training.",
+        best: true, fx: { c: 15, t: 10 },
+        result: "MFA would have blocked the login even with Deborah's password — it directly breaks a stolen-credential attack — and training lowers the odds the password is handed over at all. The control that fits the actual attack.",
+        tag: "Breaks the attack chain" },
+      { id: "b", text: "Force everyone to change their password every 30 days.",
+        fx: { c: 3 },
+        result: "Frequent rotation doesn't help here: the password was phished and used within minutes, long before any rotation. It mostly pushes users toward weaker, predictable passwords.",
+        tag: "Wrong control" },
+      { id: "c", text: "Buy a more expensive email filter and assume it catches the next one.",
+        fx: { c: 5 },
+        result: "Better filtering helps at the edge, but no filter catches everything, and this one slipped through. It wouldn't have stopped the login once the password was given up. A useful layer, not the primary fix.",
+        tag: "Edge-only" }
+    ]
+  }
+];
+/* ===================== END SCENARIO ===================== */
+
+
+/* ---- synthetic access logs (deterministic; the needles are planted) ---- */
+function buildLogs() {
+  let seed = 20261014;
+  const rnd = () => { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed / 0x7fffffff; };
+  const pick = (a) => a[Math.floor(rnd() * a.length)];
+  const users = ["s.lin","m.abara","t.rossi","k.vance","p.shah","a.gomez","j.fields","r.bianchi","n.haddad","l.ortiz","c.webb","d.okafor"];
+  const office = ["203.0.113.11","203.0.113.24","203.0.113.41","203.0.113.52","203.0.113.63","203.0.113.70","203.0.113.88","203.0.113.96"];
+  const getPaths = ["/dashboard","/reports","/reports/q3","/profile","/billing","/tickets","/tickets/new","/search?q=invoice","/api/v1/orders","/notifications","/settings"];
+  const agents = ["Chrome/126 Win","Safari/17 macOS","Firefox/128 Win","Chrome/126 Android","Edge/126 Win"];
+  const rows = [];
+  const fmt = (m) => String(8 + Math.floor(m / 60)).padStart(2, "0") + ":" + String(m % 60).padStart(2, "0");
+
+  // ~250 normal rows across 08:00-17:00 (minutes 0-540)
+  for (let i = 0; i < 250; i++) {
+    const m = Math.floor(rnd() * 540);
+    const u = pick(users);
+    const r = rnd();
+    if (r < 0.14) rows.push([m, pick(office), u, "POST", "/login", 200, 820, pick(agents)]);
+    else if (r < 0.18) rows.push([m, pick(office), u, "POST", "/login", 401, 310, pick(agents)]);
+    else if (r < 0.22) rows.push([m, pick(office), u, "GET", "/reports/download?id=" + (1000 + Math.floor(rnd()*9000)), 200, 4200 + Math.floor(rnd()*8000), pick(agents)]);
+    else if (r < 0.25) rows.push([m, pick(office), u, "GET", pick(getPaths), 404, 290, pick(agents)]);
+    else rows.push([m, pick(office), u, "GET", pick(getPaths), 200, 600 + Math.floor(rnd()*3000), pick(agents)]);
+  }
+
+  // decoy: non-admin pokes /admin and is refused (403)
+  rows.push([150, "203.0.113.52", "p.shah", "GET", "/admin", 403, 180, "Chrome/126 Win"]);
+  // decoy: external vuln scanner — different outside IP, only 404s, never logs in
+  const scanPaths = ["/wp-login.php","/.env","/admin.php","/phpmyadmin","/config.bak","/.git/config"];
+  for (let i = 0; i < 6; i++) rows.push([363 + i, "198.51.100.77", "-", "GET", scanPaths[i], 404, 0, "curl/8.4"]);
+
+  // THE ATTACK — attacker IP 198.51.100.23 after the 13:02 phishing click
+  const atk = "198.51.100.23";
+  // Deborah's own normal sessions (office IP) earlier
+  rows.push([72, "203.0.113.41", "d.okafor", "POST", "/login", 200, 820, "Safari/17 macOS"]);
+  rows.push([74, "203.0.113.41", "d.okafor", "GET", "/dashboard", 200, 2100, "Safari/17 macOS"]);
+  rows.push([220, "203.0.113.41", "d.okafor", "GET", "/reports", 200, 1900, "Safari/17 macOS"]);
+  // attacker: 14:17 login success as d.okafor from outside, then admin access + export
+  rows.push([377, atk, "d.okafor", "POST", "/login", 200, 820, "curl/8.4"]);
+  rows.push([379, atk, "d.okafor", "GET", "/admin", 200, 3300, "curl/8.4"]);
+  rows.push([381, atk, "d.okafor", "GET", "/admin/customers", 200, 7400, "curl/8.4"]);
+  rows.push([384, atk, "d.okafor", "POST", "/admin/export?format=csv&rows=48213", 200, 5120340, "curl/8.4"]);
+  rows.push([386, atk, "d.okafor", "GET", "/admin/customers?page=2", 200, 7100, "curl/8.4"]);
+
+  rows.sort((a, b) => a[0] - b[0]);
+  return rows.map(r => ({ time: fmt(r[0]), ip: r[1], account: r[2], method: r[3], path: r[4], status: r[5], bytes: r[6], agent: r[7] }));
+}
+const LOGS = buildLogs();
+
+
+/* ============== ENGINE ============== */
+const KEY = "soclab-soc01-v1";
+const $ = (s) => document.querySelector(s);
+const el = (t, c, h) => { const n = document.createElement(t); if (c) n.className = c; if (h != null) n.innerHTML = h; return n; };
+const esc = (s) => String(s).replace(/[&<>]/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;" }[c]));
+
+let state = loadState();
+function fresh() { return { started: false, idx: 0, answers: {}, decisions: {}, meters: { c: 30, t: 60, o: 70 }, tools: ["mail"], tool: "mail", query: "", chips: [] }; }
+function loadState() { try { const r = localStorage.getItem(KEY); if (r) { const s = JSON.parse(r); if (s && typeof s.idx === "number") return s; } } catch (e) {} return fresh(); }
+function save() { try { localStorage.setItem(KEY, JSON.stringify(state)); } catch (e) {} }
+
+async function sha256(str) { const b = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(str)); return [...new Uint8Array(b)].map(x => x.toString(16).padStart(2,"0")).join(""); }
+function norm(v, mode) { let s = String(v).trim().toLowerCase(); if (mode === "digits") s = s.replace(/[^0-9]/g, ""); else s = s.replace(/^@/, "").replace(/\s+/g, ""); return s; }
+
+/* top bar */
+function renderBar() {
+  const stepsEl = $("#steps"); stepsEl.innerHTML = "";
+  STEPS.forEach((s, i) => stepsEl.appendChild(el("li", i < state.idx ? "done" : i === state.idx ? "now" : "", s.label)));
+  const done = Math.min(state.idx, STEPS.length);
+  $("#progress").innerHTML = `Step <b>${Math.min(state.idx + 1, STEPS.length)}</b> / ${STEPS.length}`;
+}
+
+/* tools: email + log console */
+function renderTools() {
+  const tabs = $("#toolTabs"); tabs.innerHTML = "";
+  const defs = [ { id: "mail", label: "Reported email" }, { id: "logs", label: "Access logs" } ];
+  defs.forEach(d => {
+    const unlocked = state.tools.includes(d.id);
+    const t = el("button", "ttab" + (state.tool === d.id ? " active" : ""));
+    t.setAttribute("role", "tab");
+    t.innerHTML = d.label + (unlocked ? "" : ` <span class="lock">LOCKED</span>`);
+    t.disabled = !unlocked;
+    if (unlocked) t.addEventListener("click", () => { state.tool = d.id; save(); renderTools(); });
+    tabs.appendChild(t);
+  });
+  const body = $("#toolBody"); body.innerHTML = "";
+  if (state.tool === "mail") renderMail(body); else renderLogs(body);
+}
+
+function renderMail(body) {
+  const meta = el("div", "mail-meta");
+  meta.innerHTML = `<span>From: <b>${esc(EMAIL.from)}</b></span><span>To: ${esc(EMAIL.to)}</span><span>Received: ${esc(EMAIL.received)}</span>`;
+  body.appendChild(meta);
+  body.appendChild(el("p", "console-help", "Full message source — read the headers, not just the body."));
+  body.appendChild(el("pre", "doc", esc(EMAIL.raw)));
+}
+
+function renderLogs(body) {
+  const top = el("div", "console-top");
+  const sw = el("div", "search-wrap");
+  const input = document.createElement("input");
+  input.type = "text"; input.placeholder = "Search logs (IP, account, path, status…) — space = AND"; input.value = state.query; input.spellcheck = false; input.autocomplete = "off";
+  input.addEventListener("input", () => { state.query = input.value; save(); drawTable(); });
+  const clear = el("button", "btn ghost", "Clear");
+  clear.addEventListener("click", () => { state.query = ""; state.chips = []; save(); renderLogs(body); });
+  sw.appendChild(input); sw.appendChild(clear);
+  top.appendChild(sw);
+
+  const chipDefs = ["POST /login","200","401","/admin","198.51.100.","203.0.113.","d.okafor","/admin/export"];
+  const chips = el("div", "chips");
+  chipDefs.forEach(c => {
+    const b = el("button", "fchip" + (state.chips.includes(c) ? " on" : ""), esc(c));
+    b.addEventListener("click", () => {
+      state.chips = state.chips.includes(c) ? state.chips.filter(x => x !== c) : [...state.chips, c];
+      save(); renderLogs(body);
+    });
+    chips.appendChild(b);
+  });
+  top.appendChild(chips);
+  const countLine = el("div", "count"); countLine.id = "logCount";
+  top.appendChild(countLine);
+  body.appendChild(top);
+  body.appendChild(el("p", "console-help", `${LOGS.length} total events · Tue 14 Oct · portal.driftwood-analytics.com`));
+
+  const wrap = el("div", "table-wrap");
+  const table = el("table");
+  table.innerHTML = `<thead><tr><th>Time</th><th>Source IP</th><th>Account</th><th>Method</th><th>Path</th><th>Status</th><th>Bytes</th><th>User-Agent</th></tr></thead><tbody id="logBody"></tbody>`;
+  wrap.appendChild(table); body.appendChild(wrap);
+  drawTable();
+}
+
+function activeTerms() {
+  const terms = [];
+  state.chips.forEach(c => terms.push(c.toLowerCase()));
+  state.query.trim().toLowerCase().split(/\s+/).filter(Boolean).forEach(t => terms.push(t));
+  return terms;
+}
+function rowText(r) { return `${r.time} ${r.ip} ${r.account} ${r.method} ${r.path} ${r.status} ${r.bytes} ${r.agent}`.toLowerCase(); }
+function drawTable() {
+  const terms = activeTerms();
+  const matched = LOGS.filter(r => { const txt = rowText(r); return terms.every(t => txt.includes(t)); });
+  const tb = $("#logBody"); if (!tb) return;
+  tb.innerHTML = "";
+  const hl = terms.filter(t => t.length >= 2);
+  const mark = (v) => { let s = esc(String(v)); hl.forEach(t => { const re = new RegExp("(" + t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + ")", "ig"); s = s.replace(re, "<mark>$1</mark>"); }); return s; };
+  matched.slice(0, 400).forEach(r => {
+    const tr = el("tr");
+    tr.innerHTML = `<td>${r.time}</td><td>${mark(r.ip)}</td><td>${mark(r.account)}</td><td>${mark(r.method)}</td>`
+      + `<td class="path">${mark(r.path)}</td><td class="st-${r.status}">${mark(r.status)}</td>`
+      + `<td>${r.bytes.toLocaleString()}</td><td>${esc(r.agent)}</td>`;
+    tb.appendChild(tr);
+  });
+  if (!matched.length) tb.innerHTML = `<tr><td colspan="8"><div class="norows">No events match your filters. Try removing a term.</div></td></tr>`;
+  const cnt = $("#logCount");
+  if (cnt) cnt.innerHTML = `<b>${matched.length}</b> of ${LOGS.length} events match` + (terms.length ? ` · filters: ${terms.map(esc).join(" + ")}` : "");
+}
+
+/* step rendering */
+function renderStep() {
+  renderBar();
+  if (state.idx >= STEPS.length) return renderReport();
+  const s = STEPS[state.idx];
+  const task = $("#task"); task.innerHTML = "";
+  const head = el("div", "task-head");
+  head.appendChild(el("h2", null, esc(s.title)));
+  head.appendChild(el("span", "counter", `Step ${state.idx + 1} / ${STEPS.length}`));
+  task.appendChild(head);
+
+  const msg = el("div", "msg");
+  msg.innerHTML = `<div class="avatar">${s.from.initials}</div><div><div class="who"><b>${esc(s.from.name)}</b> · ${esc(s.from.role)}</div><p>${esc(s.message)}</p></div>`;
+  task.appendChild(msg);
+
+  const brief = el("div", "brief");
+  s.brief.forEach(p => brief.appendChild(el("p", null, esc(p))));
+  task.appendChild(brief);
+
+  if (s.steer) { const st = el("div", "steer"); st.appendChild(el("p", null, s.steer)); task.appendChild(st); }
+
+  const jump = el("button", "to-tools", "↓ Jump to the tools");
+  jump.addEventListener("click", () => document.querySelector(".tools").scrollIntoView({ behavior: "smooth", block: "start" }));
+  task.appendChild(jump);
+
+  if (s.kind === "decision") renderDecision(task, s);
+  else renderQuestionFields(task, s);
+}
+
+function renderQuestionFields(task, s) {
+  const form = el("form", "fieldset");
+  const solved = s.fields.every(f => state.answers[f.id]);
+  s.fields.forEach(f => {
+    const prev = state.answers[f.id];
+    const fld = el("div", "field");
+    fld.appendChild(el("label", null, esc(f.label)));
+    if (f.sub) fld.appendChild(el("p", "sub", esc(f.sub)));
+    const row = el("div", "answer-row");
+    const input = document.createElement("input");
+    input.type = "text"; input.placeholder = f.placeholder || ""; input.spellcheck = false; input.autocomplete = "off";
+    if (prev) { input.value = prev; input.disabled = true; }
+    const status = el("span", "status" + (prev ? " ok" : ""), prev ? "✓" : "");
+    row.appendChild(input); row.appendChild(status);
+    fld.appendChild(row);
+    if (f.tip) { const d = el("details", "tip"); d.innerHTML = `<summary>Stuck? Show a nudge</summary><p>${f.tip}</p>`; fld.appendChild(d); }
+    f._i = input; f._s = status;
+    form.appendChild(fld);
+  });
+  if (!solved) {
+    const row = el("div", "actions");
+    const check = el("button", "btn", "Check " + (s.fields.length > 1 ? "answers" : "answer")); check.type = "submit";
+    row.appendChild(check);
+    form.appendChild(row);
+  }
+  form.addEventListener("submit", (e) => { e.preventDefault(); checkFields(s); });
+  task.appendChild(form);
+  if (solved) task.appendChild(nextBtn());
+}
+
+async function checkFields(s) {
+  for (const f of s.fields) {
+    if (state.answers[f.id]) continue;
+    const spec = ANSWERS[f.id];
+    const val = norm(f._i.value, spec.norm);
+    if (!val) { f._s.textContent = "—"; f._s.className = "status"; continue; }
+    const h = await sha256(val);
+    if (h === spec.hash) { state.answers[f.id] = val; f._i.disabled = true; f._s.textContent = "✓ correct"; f._s.className = "status ok"; }
+    else { f._s.textContent = "✗ not it"; f._s.className = "status no"; }
+  }
+  save();
+  if (s.fields.every(f => state.answers[f.id])) renderStep();
+}
+
+function renderDecision(task, s) {
+  task.appendChild(el("p", "prompt", esc(s.prompt)));
+  const prev = state.decisions["step" + state.idx];
+  const opts = el("div", "options");
+  s.options.forEach((o, i) => {
+    const btn = el("button", "opt");
+    btn.innerHTML = `<span class="key">${String.fromCharCode(65 + i)}</span><span>${esc(o.text)}</span>`;
+    if (prev) { btn.disabled = true; btn.classList.add(o.id === prev ? "chosen" : "faded"); }
+    else btn.addEventListener("click", () => pick(s, o));
+    opts.appendChild(btn);
+  });
+  task.appendChild(opts);
+  if (prev) {
+    const o = s.options.find(x => x.id === prev);
+    const out = el("div", "outcome"); out.appendChild(el("p", null, esc(o.result)));
+    task.appendChild(out);
+    task.appendChild(nextBtn());
+  }
+}
+function pick(s, o) {
+  Object.entries(o.fx || {}).forEach(([k, v]) => { state.meters[k] = Math.max(0, Math.min(100, (state.meters[k] || 0) + v)); });
+  state.decisions["step" + state.idx] = o.id;
+  save(); renderStep();
+}
+function nextBtn() {
+  const row = el("div", "actions");
+  const b = el("button", "btn", state.idx + 1 >= STEPS.length ? "Close the case →" : "Next step →");
+  b.addEventListener("click", advance);
+  row.appendChild(b);
+  return row;
+}
+function advance() {
+  state.idx++;
+  const s = STEPS[state.idx];
+  if (s && s.unlock && !state.tools.includes(s.unlock)) { state.tools.push(s.unlock); state.tool = s.unlock; }
+  save();
+  renderStep(); renderTools();
+  $("#console").scrollIntoView({ behavior: "smooth", block: "start" });
+}
+
+/* report + flag */
+async function renderReport() {
+  $("#console").hidden = true;
+  const r = $("#report"); r.hidden = false; r.innerHTML = "";
+  const decCount = STEPS.filter(s => s.kind === "decision").length;
+  const bestCount = STEPS.filter((s, i) => s.kind === "decision" && s.options.find(o => o.best && o.id === state.decisions["step" + i])).length;
+  const avg = (state.meters.c + state.meters.t + state.meters.o) / 3;
+  let grade, verdict;
+  if (bestCount === decCount && avg >= 70) { grade = "A"; verdict = "Clean investigation and a textbook response. You traced the takeover from the evidence and contained it precisely without overreacting."; }
+  else if (bestCount >= decCount - 1 && avg >= 55) { grade = "B"; verdict = "Good investigative work. One response choice cost more than it needed to — see the debrief."; }
+  else if (avg >= 42) { grade = "C"; verdict = "You found the facts, but the response choices made the incident costlier than it had to be."; }
+  else { grade = "D"; verdict = "Review the debrief — the containment and prevention choices here would have done real damage."; }
+
+  const flag = (state.answers.q_account && state.answers.q_ip && state.answers.q_domain)
+    ? `FLAG{${state.answers.q_account}_${state.answers.q_ip}_${state.answers.q_domain}}` : null;
+
+  r.appendChild(el("div", "eyebrow", "Case report · CASE-2026-1014-SEV2"));
+  const vr = el("div", "verdict");
+  const gc = grade === "A" ? "var(--good)" : grade === "D" ? "var(--bad)" : "var(--accent)";
+  vr.innerHTML = `<div class="grade" style="color:${gc}">${grade}</div><div><h2>Case closed</h2><p>${verdict}</p></div>`;
+  r.appendChild(vr);
+
+  r.appendChild(el("h2", null, "What you established"));
+  const facts = el("div", "facts");
+  facts.innerHTML =
+    `<div><span class="eyebrow">Phishing domain</span><b>${esc(state.answers.q_domain || "—")}</b></div>` +
+    `<div><span class="eyebrow">Compromised account</span><b>${esc(state.answers.q_account || "—")}</b></div>` +
+    `<div><span class="eyebrow">Attacker IP</span><b>${esc(state.answers.q_ip || "—")}</b></div>` +
+    `<div><span class="eyebrow">Records exfiltrated</span><b>${state.answers.q_records ? Number(state.answers.q_records).toLocaleString() : "—"}</b></div>` +
+    `<div><span class="eyebrow">Entry vector</span><b>Phishing → credential theft</b></div>` +
+    `<div><span class="eyebrow">Severity</span><b>SEV-2 · data exfiltration</b></div>`;
+  facts.style.gridTemplateColumns = "repeat(3, minmax(0,1fr))";
+  r.appendChild(facts);
+
+  if (flag) {
+    r.appendChild(el("h2", null, "Your flag"));
+    const fb = el("div", "flagbox");
+    fb.innerHTML = `<code id="flagText">${esc(flag)}</code>`;
+    const copy = el("button", "btn ghost", "Copy");
+    copy.addEventListener("click", async () => { try { await navigator.clipboard.writeText(flag); copy.textContent = "Copied"; setTimeout(() => copy.textContent = "Copy", 1500); } catch (e) { const rg = document.createRange(); rg.selectNode($("#flagText")); const sel = getSelection(); sel.removeAllRanges(); sel.addRange(rg); } });
+    fb.appendChild(copy); r.appendChild(fb);
+    r.appendChild(el("p", "hint", "Built from the three facts you recovered. Submit it on your course platform. The grade reflects your two response decisions and is for your own learning."));
+  } else {
+    r.appendChild(el("h2", null, "No flag yet"));
+    r.appendChild(el("p", "hint", "The flag is assembled only when you've recovered the phishing domain, the compromised account and the attacker IP. Use “Review this case” to finish the investigation."));
+  }
+
+  r.appendChild(el("h2", null, "Debrief"));
+  const list = el("ol", "debrief");
+  STEPS.forEach((s, i) => {
+    const li = el("li");
+    li.appendChild(el("div", "t", s.label));
+    const b = el("div");
+    b.appendChild(el("h3", null, s.title));
+    if (s.kind === "decision") {
+      const chosen = s.options.find(o => o.id === state.decisions["step" + i]);
+      const best = s.options.find(o => o.best);
+      if (chosen) { const p = el("p", "yours " + (chosen.best ? "good" : "bad")); p.textContent = `You chose: ${chosen.text} (${chosen.tag})`; b.appendChild(p); }
+      if (!chosen || !chosen.best) { const p = el("p", "lesson"); p.innerHTML = `<b>Best response:</b> ${esc(best.text)}`; b.appendChild(p); }
+    } else {
+      s.fields.forEach(f => { const a = state.answers[f.id]; const p = el("p", "yours " + (a ? "good" : "bad")); p.textContent = a ? `Recovered: ${a}` : "Not recovered"; b.appendChild(p); });
+    }
+    li.appendChild(b); list.appendChild(li);
+  });
+  r.appendChild(list);
+
+  const row = el("div", "restart-row");
+  const again = el("button", "btn ghost", "Review this case");
+  again.addEventListener("click", () => { state.idx = 0; save(); $("#report").hidden = true; $("#console").hidden = false; renderStep(); renderTools(); window.scrollTo({ top: 0, behavior: "smooth" }); });
+  const reset = el("button", "btn", "Start a fresh case");
+  reset.addEventListener("click", resetAll);
+  row.appendChild(again); row.appendChild(reset);
+  r.appendChild(row);
+  window.scrollTo({ top: 0, behavior: "smooth" });
+}
+
+function resetAll() { state = fresh(); save(); $("#report").hidden = true; $("#console").hidden = true; $("#briefing").hidden = false; $("#resetBtn").hidden = true; $("#resumeHint").hidden = true; renderBar(); window.scrollTo({ top: 0, behavior: "smooth" }); }
+
+function begin() {
+  state.started = true; save();
+  $("#briefing").hidden = true; $("#report").hidden = true; $("#console").hidden = false;
+  renderStep(); renderTools();
+}
+$("#startBtn").addEventListener("click", begin);
+$("#resetBtn").addEventListener("click", resetAll);
+
+renderBar();
+if (state.started) {
+  $("#resumeHint").hidden = false; $("#resetBtn").hidden = false;
+  if (state.idx >= STEPS.length) { $("#briefing").hidden = true; $("#console").hidden = false; renderReport(); }
+  else begin();
+}
+</script>
+</body>
+</html>
